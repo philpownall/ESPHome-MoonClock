@@ -1,0 +1,215 @@
+<h1 id="an-esphome-moon-clock">An ESPHome Moon Clock</h1>
+<p>by Phil Pownall</p>
+<p>This Moon Clock shows the Moon Phase using a globe, and the Moon Azimuth and Elevation on an attached display.
+The device consists of a (Moon) globe printed in two different color hemispheres (I chose Blue and transparent White).
+The Moon globe rotates during the lunar month, and the internal LED lights up when the Moon is visible above the horizon.
+The device uses ESPHome to program an ESP32, and the IPGeolocation Astronomy API.</p>
+<p><a href="MoonClock.png">Moon Clock</a></p>
+<h3 id="ingredients">Ingredients</h3>
+<ul>
+<li>An ESP32 device running ESPHome</li>
+<li>A 608ZZ bearing</li>
+<li>A SG90 or MG90 180-degree servo motor</li>
+<li>A Yellow or Blue LED</li>
+<li>An SSD1306 128x64 display</li>
+<li>A 3D-printed mount consisting of a base, a cog, a platform and a globe</li>
+</ul>
+<h3 id="optional-ingredients">Optional ingredients</h3>
+<ul>
+<li>An ESP32 Expansion board to supply power and additional pins</li>
+<li>A 9V power adapter for the Expansion board</li>
+</ul>
+<h2 id="the-mount">The Mount</h2>
+<p>The mount was designed in TinkerCAD, providing a base for the SG90 servo
+STL files for the design are available in this repository: 
+[TinkerCAD Moon Clock v2] (<a href="https://www.tinkercad.com/things/8dPIg13zxnB-moon-clock-v2">https://www.tinkercad.com/things/8dPIg13zxnB-moon-clock-v2</a>)</p>
+<p>The platform consists of a 1X cog and a Moon Globe.  The platform and the !X Cog have a hole in the centre for the LED wires. 
+The platform sits on top of the bearing which is in the top of the base.
+The 2X cog sits on top of the servo, and interlocks with the 1X cog.</p>
+<p>To set up the tracker, </p>
+<ul>
+<li>Set the servo to its centre position (180 degrees) using the number slider</li>
+<li>Position the base with the Moon Globe with the Full Moon (white side facing you), and </li>
+<li>Tighten the 2X cog screw into the servo.</li>
+<li>enter your location (latitude and Longitude) and the IPGeolocation Astronomy API key into your secrets file</li>
+<li>compile and install the MoonClock.yaml into your ESP32 device</li>
+<li>plug the ESP32 adapter in to start the Moon Phase Tracker</li>
+</ul>
+<h1 id="the-esphome-code">The ESPHome code</h1>
+<p>The ESPHome yaml code consists of the following key sections:</p>
+<ul>
+<li>the <em>get_attributes</em> script which uses <em>http_request</em> to fetch the Moon parameters from the IPGeo Astronomy API</li>
+<li>the servo number template which updates the servo position with the Moon Phase Angle</li>
+<li>the display code</li>
+<li>a time automation to update the Moon position</li>
+</ul>
+<h2 id="get_attributes-script">Get_Attributes Script</h2>
+<p>The script uses <em>http_request</em> to fetch the current Moon position and phase (for your location) from the IPGeolocation Astronomy API (in a json format).
+The json::parse_json* function is used to parse the json, and set the display variables and the Moon Phase servo position.</p>
+<h3 id="example-script-definition">Example Script Definition</h3>
+<pre><code>script:
+  - id: get_attributes
+    then:
+      - logger.log: 
+          format: &quot;moon-clock: Get Request initiated&quot;
+          level: INFO
+      - http_request.get:
+          capture_response: true
+          # max_response_buffer_size: 1024
+          headers:
+            Content-Type: application/json
+          url: !lambda |-
+            return &quot;https://api.ipgeolocation.io/astronomy?apiKey=${ipg_api_key}&amp;lat=${my_latitude}&amp;long=${my_longitude}&quot;;
+          on_response:
+            - if:
+                condition:
+                  lambda: |-
+                    return response-&gt;status_code == 200;
+                then:
+                  - logger.log: 
+                      format: &quot;moon-clock: Get Request succeeded...&quot;
+                      level: INFO
+                  - lambda: |-
+                      json::parse_json(body, [](JsonObject root) {
+                          id(moon_altitude).publish_state(root[&quot;moon_altitude&quot;]);
+                          id(moon_azimuth).publish_state(root[&quot;moon_azimuth&quot;]);
+                          // use call.set_value rather than publish state for number template
+                          auto call = id(moon_angle).make_call();
+                          call.set_value(root[&quot;moon_angle&quot;]);
+                          call.perform();
+                          id(moonrise).publish_state(root[&quot;moonrise&quot;]);
+                          id(moonset).publish_state(root[&quot;moonset&quot;]);
+                          id(moon_phase).publish_state(root[&quot;moon_phase&quot;]);
+                          return true;
+                      });
+                else:
+                - logger.log: 
+                    format: &quot;moon-clock: Get Request - error!!!&quot;
+                    level: ERROR
+      - if:
+          condition:
+            lambda: &#39;return id(moon_altitude).state &gt; 0;&#39;
+          then:
+            - logger.log: 
+                format: &quot;moon-clock: The moon is up&quot;
+                level: INFO
+            - light.turn_on: yellow_led
+          else:
+            - logger.log: 
+                format: &quot;moon-clock: The moon is below the horizon&quot;
+                level: INFO
+            - light.turn_off: yellow_led
+      - logger.log: 
+          format: &quot;moon-clock: Get Request finished&quot;
+          level: INFO
+</code></pre>
+<h2 id="servo-number-template">Servo Number Template</h2>
+<p>The number template drives the servo to the correct Phase Angle of the Moon.
+The Phase Angle varies from 0 degrees (New Moon) through the waxing phases to 180 degrees (Full Moon), and through the waning phases to 360 degrees (New Moon again).
+The 2X Cog generates the full 360-degree rotation from a 180-degree SG90 servo.
+The formula translates the Moon Phase Angle from 0-360 to -1 to +1 for the servo.</p>
+<h3 id="example-definition-of-a-number-template-to-drive-the-moon-phase-servo">Example Definition of a number template to drive the Moon Phase servo</h3>
+<pre><code>number:
+  - platform: template
+    name: Moon Angle
+    id: moon_angle
+    min_value: 0
+    initial_value: 180
+    max_value: 360
+    step: 0.1
+    optimistic: True
+    set_action:
+      then:
+        - servo.write:
+            id: servo_phase
+            level: !lambda &#39;return ((x / 360.0)* 2) - 1.0;&#39;
+</code></pre>
+<h2 id="display-code">Display Code</h2>
+<p>The display code shows the Moon position, rise and set times, and Moon Phase Angle.
+Font Glyphs are used to display an icon with each item, and small Moon images are used to show the major phases.
+The Interval automation cycles the dsiplay page every 5 seconds</p>
+<h3 id="example-definition-of-output-and-servo-for-moon-phase-angle">Example Definition of output and servo for Moon Phase Angle</h3>
+<pre><code>display:
+  - platform: ssd1306_i2c
+    model: &quot;SSD1306 128x64&quot;
+    reset_pin: GPIO25 # an unused pin
+    address: 0x3C
+    id: my_display
+    flip_x: True
+    flip_y: True
+    pages:
+      - id: page1
+        lambda: |-
+          it.strftime(64, 10, id(font3), TextAlign::TOP_CENTER, &quot;%H:%M&quot;, id(sntp_time).now());
+      - id: page2
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, &quot;MOONRISE&quot;);
+          it.print(75, 10, id(icons), &quot;󱴗&quot;);
+          it.printf(5, 20, id(font1), &quot;%s&quot;, id(moonrise).state.c_str());
+      - id: page3
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, &quot;ALTITUDE&quot;);
+          it.print(75, 14, id(icons), &quot;󰤷&quot;);
+          it.printf(25, 21, id(font1), &quot;%.0f°&quot;, id(moon_altitude).state);
+      - id: page4
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, &quot;AZIMUTH&quot;);
+          it.print(75, 14, id(icons), &quot;󰆌&quot;);
+          it.printf(20, 20, id(font1), &quot;%.0f°&quot;, id(moon_azimuth).state);
+      - id: page5
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, &quot;MOONSET&quot;);
+          it.print(75, 10, id(icons), &quot;󱴕&quot;);
+          it.printf(6, 21, id(font1), &quot;%s&quot;, id(moonset).state.c_str());
+      - id: page6
+        lambda: |-
+          // Print Moon Phase in top centre
+          it.printf(64, 0, id(font2), TextAlign::TOP_CENTER, &quot;%.12s&quot;, id(moon_phase).state.c_str());
+          it.printf(10, 25, id(font1), &quot;%.0f°&quot;, id(moon_angle).state);
+          if (id(moon_phase).state == &quot;NEW_MOON&quot;)  {
+            it.image(70, 16, id(new_moon), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == &quot;WAXING_CRESCENT&quot;)  {
+            it.image(70, 16, id(waxing_crescent), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == &quot;FIRST_QUARTER&quot;)  {
+            it.image(70, 16, id(first_quarter), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == &quot;WAXING_GIBBOUS&quot;)  {
+            it.image(70, 16, id(waxing_gibbous), COLOR_OFF, COLOR_ON);
+          } else if ((id(moon_phase).state == &quot;FULL_MOON&quot;)) {
+            it.image(70, 16, id(full_moon), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == &quot;WANING_GIBBOUS&quot;)  {
+            it.image(70, 16, id(waning_gibbous), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == &quot;LAST_QUART&quot;)  {
+            it.image(70, 16, id(last_quarter), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == &quot;WANING_CRESCENT&quot;)  {
+            it.image(70, 16, id(waning_crescent), COLOR_OFF, COLOR_ON);
+          } else {
+            it.printf(0, 40, id(font2), &quot;%s&quot;, id(moon_phase).state.c_str());
+          }
+
+interval:
+  # update the display page every 5 seconds
+  - interval: 5s
+    then:
+      - display.page.show_next: my_display
+      - component.update: my_display
+</code></pre>
+<h2 id="time-automation">Time Automation</h2>
+<pre><code>time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${my_timezone}
+
+    on_time:
+      # get Moon data every 10 minutes
+      - seconds: 0
+        minutes: /10
+        then:
+          - logger.log:
+              format: &quot;moon-clock: every 10 minutes...&quot;
+              level: INFO
+          - script.execute: get_attributes
+          - display.page.show: page1
+</code></pre>
+<h2 id="next-steps">Next Steps</h2>
+<p>Printing the white Moon hemisphere as a Lithophane... and scaling up to a 6&quot; globe.</p>
+

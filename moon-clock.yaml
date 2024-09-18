@@ -1,0 +1,410 @@
+# Moon Phase Clock
+
+# This is an ESPHome standalone application - it does not require Home Assistant to function
+# It uses pr#6953 (with a working http_request)
+# The node can be accessed through the web browser at espnode9.local
+# It uses IPGeolocation's API to get Moon data in a json
+
+# The device uses 
+#   one SSD1306 display
+#   1 MG90 servo motor
+#   1 yellow LED
+
+substitutions:
+  nodename: "moon-clock"
+  # latitude and longitude of your location
+  my_latitude: !secret my_lat
+  my_longitude: !secret my_long
+  # timezone for use by the sntp time platform
+  my_timezone: !secret timezone 
+  # api key for ipgeolocation.io
+  ipg_api_key: !secret ip_geo  
+
+  # pin assignments
+  servo_phase: GPIO18
+  led_yellow: GPIO22
+  display_sda: GPIO26
+  display_scl: GPIO27
+
+external_components:
+  # makes http_request work with content-length: -1
+  - source: github://pr#6953
+    components: [ http_request ]
+
+script:
+  - id: get_attributes
+    then:
+      - logger.log: 
+          format: "moon-clock: Get Request initiated"
+          level: INFO
+      - http_request.get:
+          capture_response: true
+          # max_response_buffer_size: 1024
+          headers:
+            Content-Type: application/json
+          url: !lambda |-
+            return "https://api.ipgeolocation.io/astronomy?apiKey=${ipg_api_key}&lat=${my_latitude}&long=${my_longitude}";
+          on_response:
+            - if:
+                condition:
+                  lambda: |-
+                    return response->status_code == 200;
+                then:
+                  - logger.log: 
+                      format: "moon-clock: Get Request succeeded..."
+                      level: INFO
+                  - lambda: |-
+                      json::parse_json(body, [](JsonObject root) {
+                          id(moon_altitude).publish_state(root["moon_altitude"]);
+                          id(moon_azimuth).publish_state(root["moon_azimuth"]);
+                          // use call.set_value rather than publish state for number template
+                          auto call = id(moon_angle).make_call();
+                          call.set_value(root["moon_angle"]);
+                          call.perform();
+                          id(moonrise).publish_state(root["moonrise"]);
+                          id(moonset).publish_state(root["moonset"]);
+                          id(moon_phase).publish_state(root["moon_phase"]);
+                          return true;
+                      });
+                else:
+                - logger.log: 
+                    format: "moon-clock: Get Request - error!!!"
+                    level: ERROR
+      - if:
+          condition:
+            lambda: 'return id(moon_altitude).state > 0;'
+          then:
+            - logger.log: 
+                format: "moon-clock: The moon is up"
+                level: INFO
+            - light.turn_on: yellow_led
+          else:
+            - logger.log: 
+                format: "moon-clock: The moon is below the horizon"
+                level: INFO
+            - light.turn_off: yellow_led
+      - logger.log: 
+          format: "moon-clock: Get Request finished"
+          level: INFO
+
+esphome:
+  name: $nodename
+  friendly_name: $nodename
+  on_boot:
+    priority: -100 # After everything initialized
+    then:
+      - script.execute: get_attributes
+      - switch.turn_on: display_switch
+      - display.page.show: page1
+
+esp32:
+  board: nodemcu-32s
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Enable startup debug info
+debug:
+
+# Home Assistant API is not required
+# Enable Home Assistant API
+# api:
+#   encryption:
+#     key: "qlKndjcGNRNFF1lwSWcBt8lYwWJpeAaKYrCQtniU3dQ="
+
+ota:
+  platform: esphome
+
+wifi:
+  networks:
+  - ssid: !secret wifi_ssid
+    password: !secret wifi_password
+  - ssid: !secret wifi_ssid2
+    password: !secret wifi_password2
+  - ssid: !secret wifi_ssid3
+    password: !secret wifi_password3
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: $nodename
+    password: !secret wifi_password
+
+captive_portal:
+
+# enable (local) web server
+web_server:
+  version: 2
+  port: 80
+  include_internal: true
+  local: true
+
+binary_sensor:
+  - platform: status
+    name: Status
+
+light:
+  # yellow LED
+  - platform: binary
+    name: "Yellow LED"
+    id: yellow_led
+    output: led_2
+
+button:
+  - platform: restart
+    name: reboot
+    id: reboot
+
+  - platform: shutdown
+    name: shutdown
+
+switch:
+  - platform: template
+    name: "Display Switch"
+    id: display_switch
+    optimistic: True
+    turn_on_action:
+      - lambda: id(my_display).turn_on();
+    turn_off_action:
+      - lambda: id(my_display).turn_off();
+
+number:
+  - platform: template
+    name: Moon Altitude
+    id: moon_altitude
+    min_value: -90
+    initial_value: 0
+    max_value: 90
+    step: 0.1
+    optimistic: True
+    # set_action:
+    #   then:
+    #     - logger.log: 
+    #         format: "Moon Altitude Updated to %.2f"
+    #         args: [ 'id(moon_altitude).state' ]
+    #         level: WARN
+
+  - platform: template
+    name: Moon Azimuth
+    id: moon_azimuth
+    min_value: 0
+    initial_value: 180
+    max_value: 360
+    step: 0.1
+    optimistic: True
+    # set_action:
+    #   then:
+    #     - logger.log: 
+    #         format: "Moon Azimuth Updated to %.2f"
+    #         args: [ 'id(moon_azimuth).state' ]
+    #         level: WARN
+
+  - platform: template
+    name: Moon Angle
+    id: moon_angle
+    min_value: 0
+    initial_value: 180
+    max_value: 360
+    step: 0.1
+    optimistic: True
+    set_action:
+      then:
+        - servo.write:
+            id: servo_phase
+            level: !lambda 'return ((x / 360.0)* 2) - 1.0;'
+        # - logger.log: 
+        #     format: "moon-clock: Moon Angle Updated to %.2f"
+        #     args: [ 'id(moon_angle).state' ]
+        #     level: INFO
+
+output:
+  # Servo output 3   
+  - platform: ledc
+    pin: ${servo_phase}
+    id: ledc_3
+    channel: 2
+    frequency: 50 Hz
+
+  # ledc PWM output for an LED
+  - platform: ledc
+    pin: ${led_yellow}
+    id: led_2
+    channel: 7
+    frequency: "1000Hz"
+
+servo:
+    # servo 3
+  - id: servo_phase
+    output: ledc_3
+    auto_detach_time: 1s
+    transition_length: 8s
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+
+  - platform: template
+    name: Moonrise
+    id: moonrise
+
+  - platform: template
+    name: Moonset
+    id: moonset
+
+  - platform: template
+    name: Moon Phase
+    id: moon_phase
+
+i2c:
+  # define an I2C bus for the SSD1306 display
+  - id: bus_b
+    sda: ${display_sda}
+    scl: ${display_scl}
+    scan: True
+    frequency: 400kHz
+
+http_request:
+  timeout: 10s
+  id: http_request_id
+  # buffer_size_rx: 1024
+  verify_ssl: false
+
+font:
+  # some fonts for the display
+  - file: 'fonts/arial.ttf'
+    id: font1
+    size: 26
+
+  - file: 'fonts/arial.ttf'
+    id: font2
+    size: 16
+
+  - file: 'fonts/arial.ttf'
+    id: font3
+    size: 40
+
+  - file: 'fonts/materialdesignicons-webfont.ttf'
+    id: icons
+    size: 48
+    glyphs: [
+        "󰤷", # angle-acute
+        "󰆌", # compass-outline
+        "󱴗", # weather-moonset-up
+        "󱴕", # weather-moonset
+        "󰽧" # moon-waxing-crescent
+     ]
+
+image:
+  - file: "./images/MoonPhases/new_moon.png"
+    id: new_moon
+  - file: "./images/MoonPhases/waxing_crescent.png"
+    id: waxing_crescent
+  - file: "./images/MoonPhases/first_quarter.png"
+    id: first_quarter
+  - file: "./images/MoonPhases/waxing_gibbous.png"
+    id: waxing_gibbous
+  - file: "./images/MoonPhases/full_moon.png"
+    id: full_moon
+  - file: "./images/MoonPhases/waning_gibbous.png"
+    id: waning_gibbous
+  - file: "./images/MoonPhases/last_quarter.png"
+    id: last_quarter
+  - file: "./images/MoonPhases/waning_crescent.png"
+    id: waning_crescent
+
+display:
+  - platform: ssd1306_i2c
+    model: "SSD1306 128x64"
+    reset_pin: GPIO25 # an unused pin
+    address: 0x3C
+    id: my_display
+    flip_x: True
+    flip_y: True
+    pages:
+      - id: page1
+        lambda: |-
+          it.strftime(64, 10, id(font3), TextAlign::TOP_CENTER, "%H:%M", id(sntp_time).now());
+      - id: page2
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, "MOONRISE");
+          it.print(75, 10, id(icons), "󱴗");
+          it.printf(5, 20, id(font1), "%s", id(moonrise).state.c_str());
+      - id: page3
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, "ALTITUDE");
+          it.print(75, 14, id(icons), "󰤷");
+          it.printf(25, 21, id(font1), "%.0f°", id(moon_altitude).state);
+      - id: page4
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, "AZIMUTH");
+          it.print(75, 14, id(icons), "󰆌");
+          it.printf(20, 20, id(font1), "%.0f°", id(moon_azimuth).state);
+      - id: page5
+        lambda: |-
+          it.print(64, 0, id(font2), TextAlign::TOP_CENTER, "MOONSET");
+          it.print(75, 10, id(icons), "󱴕");
+          it.printf(6, 21, id(font1), "%s", id(moonset).state.c_str());
+      - id: page6
+        lambda: |-
+          // Print Moon Phase in top centre
+          it.printf(64, 0, id(font2), TextAlign::TOP_CENTER, "%.12s", id(moon_phase).state.c_str());
+          it.printf(10, 25, id(font1), "%.0f°", id(moon_angle).state);
+          if (id(moon_phase).state == "NEW_MOON")  {
+            it.image(70, 16, id(new_moon), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == "WAXING_CRESCENT")  {
+            it.image(70, 16, id(waxing_crescent), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == "FIRST_QUARTER")  {
+            it.image(70, 16, id(first_quarter), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == "WAXING_GIBBOUS")  {
+            it.image(70, 16, id(waxing_gibbous), COLOR_OFF, COLOR_ON);
+          } else if ((id(moon_phase).state == "FULL_MOON")) {
+            it.image(70, 16, id(full_moon), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == "WANING_GIBBOUS")  {
+            it.image(70, 16, id(waning_gibbous), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == "LAST_QUART")  {
+            it.image(70, 16, id(last_quarter), COLOR_OFF, COLOR_ON);
+          } else if (id(moon_phase).state == "WANING_CRESCENT")  {
+            it.image(70, 16, id(waning_crescent), COLOR_OFF, COLOR_ON);
+          } else {
+            it.printf(0, 40, id(font2), "%s", id(moon_phase).state.c_str());
+          }
+
+interval:
+  # update the display page every 5 seconds
+  - interval: 5s
+    then:
+      - display.page.show_next: my_display
+      - component.update: my_display
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${my_timezone}
+    servers:
+      # 0.pool.ntp.org and 1.pool.ntp.org
+     - 159.203.8.72
+     - 167.114.93.151
+
+    on_time:
+      # Restart Every day at 03:03 (cleans up memory leaks)
+      - seconds: 0
+        minutes: 3
+        hours: 3
+        then:
+          - logger.log:
+              format: "moon-clock: daily reboot."
+              level: INFO
+          - button.press: reboot
+
+      # get Moon data every 10 minutes
+      - seconds: 0
+        minutes: /10
+        then:
+          - logger.log:
+              format: "moon-clock: every 10 minutes..."
+              level: INFO
+          - script.execute: get_attributes
+          - display.page.show: page1
